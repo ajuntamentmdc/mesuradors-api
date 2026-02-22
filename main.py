@@ -2,17 +2,14 @@
 # mesuradors-api
 # main.py
 #
-# Version: 1.2.2
+# Version: 1.2.3
 # Date: 2026-02-22
 #
-# Features:
-# - POST /ingest/{secret}     : ingest "simple" (meter_id/value/unit)
-# - POST /ingest_chs/{secret} : ChirpStack adapter (deviceInfo + object.distancia_mm)
-# - gasoil_linear:
-#     - uses meters.h_sensor_cm, meters.zm_sensor_cm, meters.litres_diposit
-#     - supports raw_unit in mm/cm/m (normalized to cm)
-# - Writes to BigQuery: mesuradors.readings
-# - Reads meter config from BigQuery: mesuradors.meters
+# Fix:
+# - Insert row keys aligned to the REAL BigQuery schema you have
+#   (event_time, meter_id, location, value, raw, uplink_id, unit,
+#    raw_value, raw_unit, raw_payload, group_id)
+# - Adds /health to show config + target table
 # ============================================================
 
 import os
@@ -32,9 +29,8 @@ DATASET_ID = os.getenv("DATASET_ID", "mesuradors")
 TABLE_READINGS = os.getenv("TABLE_READINGS", "readings")
 TABLE_METERS = os.getenv("TABLE_METERS", "meters")
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
-# IMPORTANT: idealment posar-ho com env var a Cloud Run
 INGEST_SECRET = os.getenv("INGEST_SECRET", "massanet123")
 
 app = FastAPI()
@@ -45,7 +41,6 @@ bq = bigquery.Client(project=PROJECT_ID)
 # Helpers
 # -----------------------------
 def _to_cm(raw_value: float, raw_unit: Optional[str]) -> float:
-    """Normalize distance to centimeters when possible (mm/cm/m)."""
     if raw_unit is None:
         return raw_value
     u = raw_unit.strip().lower()
@@ -59,7 +54,6 @@ def _to_cm(raw_value: float, raw_unit: Optional[str]) -> float:
 
 
 def convert_value(raw_value: float, meter: Dict[str, Any], raw_unit: Optional[str]) -> float:
-    """Apply scaling based on meter.scale_type."""
     scale = meter.get("scale_type")
 
     if scale == "gasoil_linear":
@@ -67,28 +61,19 @@ def convert_value(raw_value: float, meter: Dict[str, Any], raw_unit: Optional[st
         z = meter.get("zm_sensor_cm")
         litres = meter.get("litres_diposit")
 
-        # si falta config, retornem el raw
         if h is None or z is None or litres is None:
             return raw_value
 
-        # h i z estan en cm => normalitzem raw a cm
         raw_cm = _to_cm(raw_value, raw_unit)
-
-        # raw_cm = distància del sensor fins la superfície del líquid
         level_cm = float(h) - float(raw_cm)
         value_l = (level_cm / float(z)) * float(litres)
 
-        # clamp opcional (evitar números absurds si el sensor dona outliers)
-        # value_l = max(0.0, min(value_l, float(litres)))
-
         return round(value_l, 3)
 
-    # default: sense escala
     return raw_value
 
 
 def get_meter(meter_id: str) -> Dict[str, Any]:
-    """Load meter config row from BigQuery."""
     query = f"""
     SELECT *
     FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_METERS}`
@@ -98,9 +83,7 @@ def get_meter(meter_id: str) -> Dict[str, Any]:
     job = bq.query(
         query,
         job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("meter_id", "STRING", meter_id)
-            ]
+            query_parameters=[bigquery.ScalarQueryParameter("meter_id", "STRING", meter_id)]
         ),
     )
     rows = list(job.result())
@@ -110,11 +93,10 @@ def get_meter(meter_id: str) -> Dict[str, Any]:
 
 
 def insert_reading(row: Dict[str, Any]) -> None:
-    """Insert one row into BigQuery readings table."""
     table_id = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_READINGS}"
     errors = bq.insert_rows_json(table_id, [row])
     if errors:
-        raise HTTPException(status_code=500, detail={"bq_insert_errors": errors})
+        raise HTTPException(status_code=500, detail={"table_id": table_id, "bq_insert_errors": errors})
 
 
 def ingest_core(
@@ -123,8 +105,8 @@ def ingest_core(
     raw_unit: Optional[str],
     location: Optional[str],
     raw_payload: Dict[str, Any],
+    uplink_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Common ingest flow: meter config -> scale -> insert -> return summary."""
     now = datetime.now(timezone.utc)
 
     meter = get_meter(meter_id)
@@ -133,16 +115,19 @@ def ingest_core(
 
     value = convert_value(raw_value, meter, raw_unit)
 
+    # IMPORTANT: align to your real table schema
     row = {
-        "event_time": now.isoformat(),
-        "meter_id": meter_id,
-        "group_id": group_id,
-        "location": location,
-        "raw_value": raw_value,
-        "raw_unit": raw_unit,
-        "value": value,
-        "unit": display_unit,
-        "raw_payload": raw_payload,
+        "event_time": now,                # TIMESTAMP
+        "meter_id": meter_id,             # STRING (required)
+        "location": location,             # STRING
+        "value": value,                   # FLOAT (required)
+        "raw": None,                      # STRING (optional)
+        "uplink_id": uplink_id,           # STRING (optional)
+        "unit": display_unit,             # STRING
+        "raw_value": raw_value,           # FLOAT
+        "raw_unit": raw_unit,             # STRING
+        "raw_payload": raw_payload,       # JSON
+        "group_id": group_id,             # STRING
     }
 
     insert_reading(row)
@@ -156,6 +141,7 @@ def ingest_core(
         "value": value,
         "unit": display_unit,
         "timestamp": now.isoformat(),
+        "table_id": f"{PROJECT_ID}.{DATASET_ID}.{TABLE_READINGS}",
         "version": VERSION,
     }
 
@@ -163,22 +149,21 @@ def ingest_core(
 # -----------------------------
 # ROUTES
 # -----------------------------
-@app.get("/")
+@app.get("/health")
 def health():
-    return {"ok": True, "service": "mesuradors-api", "version": VERSION}
+    return {
+        "ok": True,
+        "version": VERSION,
+        "project": PROJECT_ID,
+        "dataset": DATASET_ID,
+        "table_readings": TABLE_READINGS,
+        "table_id": f"{PROJECT_ID}.{DATASET_ID}.{TABLE_READINGS}",
+        "secret_env_present": bool(os.getenv("INGEST_SECRET")),
+    }
 
 
 @app.post("/ingest/{secret}")
 async def ingest(secret: str, request: Request):
-    """
-    Ingest simple:
-    {
-      "meter_id": "gasoil_escola",
-      "value": 350,
-      "unit": "mm",
-      "location": "..."
-    }
-    """
     if secret != INGEST_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
@@ -199,17 +184,12 @@ async def ingest(secret: str, request: Request):
         raw_unit=raw_unit,
         location=location,
         raw_payload=body,
+        uplink_id=body.get("uplink_id"),
     )
 
 
 @app.post("/ingest_chs/{secret}")
 async def ingest_chs(secret: str, body: Dict[str, Any] = Body(...)):
-    """
-    ChirpStack event adapter.
-    Expects:
-      body.deviceInfo.deviceName == "nivell_gasoil_escola"
-      body.object.distancia_mm   (number)
-    """
     if secret != INGEST_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
@@ -217,9 +197,6 @@ async def ingest_chs(secret: str, body: Dict[str, Any] = Body(...)):
     if not device_name:
         raise HTTPException(status_code=400, detail="Missing deviceInfo.deviceName")
 
-    # Map CHS deviceName -> our meter_id
-    # (segons els teus logs, el CHS device és "nivell_gasoil_escola"
-    #  i al BigQuery meters és "gasoil_escola")
     meter_id = "gasoil_escola" if device_name == "nivell_gasoil_escola" else device_name
 
     distancia_mm = (body.get("object") or {}).get("distancia_mm")
@@ -229,10 +206,14 @@ async def ingest_chs(secret: str, body: Dict[str, Any] = Body(...)):
     raw_value = float(distancia_mm)
     raw_unit = "mm"
 
+    # Try to capture an uplink id if present in CHS event
+    uplink_id = body.get("uplinkID") or body.get("uplink_id")
+
     return ingest_core(
         meter_id=meter_id,
         raw_value=raw_value,
         raw_unit=raw_unit,
         location=None,
         raw_payload=body,
+        uplink_id=uplink_id,
     )
