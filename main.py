@@ -1,141 +1,162 @@
 # ============================================================
 # mesuradors-api
-# Version: 1.0.0
-# Build: 2026-02-22
-# Author: Ajuntament de Maçanet de Cabrenys
+# main.py
 #
-# Changelog:
+# Version: 1.1.0
+# Date: 2026-02-22
 #
-# 1.0.0 (2026-02-22)
-# - Primera versió operativa
-# - Ingesta via POST /ingest/{secret}
-# - Inserció a BigQuery
-# - Timestamp automàtic
-# - Endpoint /version
-#
+# SCALA READY VERSION
+# - Uses meters table
+# - Supports unit conversion
+# - Fully scalable architecture
 # ============================================================
 
 import os
-import datetime
-import logging
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request, HTTPException
 from google.cloud import bigquery
 
+# ------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------
 
-# ============================================================
-# CONFIGURACIÓ
-# ============================================================
+PROJECT_ID = os.getenv("PROJECT_ID", "mesuradors-mdc")
+DATASET_ID = os.getenv("DATASET_ID", "mesuradors")
 
-VERSION = "1.0.0"
-BUILD_DATE = "2026-02-22"
+TABLE_READINGS = "readings"
+TABLE_METERS = "meters"
 
-PROJECT_ID = "mesuradors-mdc"
-DATASET_ID = "mesuradors"
-TABLE_ID = "readings"
+VERSION = "1.1.0"
 
-INGEST_SECRET = os.environ.get("INGEST_SECRET", "massanet123")
+# ------------------------------------------------------------
+# INIT
+# ------------------------------------------------------------
 
-TABLE = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+app = FastAPI()
 
+bq = bigquery.Client(project=PROJECT_ID)
 
-# ============================================================
-# LOGGING
-# ============================================================
+# ------------------------------------------------------------
+# SCALE FUNCTIONS
+# ------------------------------------------------------------
 
-logging.basicConfig(level=logging.INFO)
+def convert_value(raw_value, meter):
 
-logger = logging.getLogger("mesuradors-api")
+    scale = meter.get("scale_type")
 
+    if scale == "gasoil_linear":
 
-# ============================================================
-# BIGQUERY CLIENT
-# ============================================================
+        h = meter.get("h_sensor_cm")
+        z = meter.get("zm_sensor_cm")
+        litres = meter.get("litres_diposit")
 
-bq = bigquery.Client()
+        if None in (h, z, litres):
+            return raw_value
 
+        level = h - raw_value
 
-# ============================================================
-# FASTAPI
-# ============================================================
+        value = (level / z) * litres
 
-app = FastAPI(
-    title="Mesuradors API",
-    version=VERSION
-)
+        return round(value, 3)
 
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.get("/")
-def health():
-
-    return {
-        "status": "ok",
-        "service": "mesuradors-api",
-        "version": VERSION,
-        "build": BUILD_DATE
-    }
+    return raw_value
 
 
-# ============================================================
-# VERSION INFO
-# ============================================================
+# ------------------------------------------------------------
+# GET METER CONFIG
+# ------------------------------------------------------------
 
-@app.get("/version")
-def version():
+def get_meter(meter_id):
 
-    return {
-        "service": "mesuradors-api",
-        "version": VERSION,
-        "build": BUILD_DATE,
-        "project": PROJECT_ID,
-        "dataset": DATASET_ID,
-        "table": TABLE_ID
-    }
+    query = f"""
+    SELECT *
+    FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_METERS}`
+    WHERE meter_id = @meter_id
+    """
+
+    job = bq.query(
+        query,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter(
+                    "meter_id",
+                    "STRING",
+                    meter_id
+                )
+            ]
+        )
+    )
+
+    rows = list(job.result())
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Meter not found: {meter_id}"
+        )
+
+    return dict(rows[0])
 
 
-# ============================================================
-# INGEST ENDPOINT
-# ============================================================
+# ------------------------------------------------------------
+# INSERT
+# ------------------------------------------------------------
+
+def insert_reading(data):
+
+    table_id = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_READINGS}"
+
+    errors = bq.insert_rows_json(
+        table_id,
+        [data]
+    )
+
+    if errors:
+        raise HTTPException(
+            status_code=500,
+            detail=errors
+        )
+
+
+# ------------------------------------------------------------
+# ROUTE
+# ------------------------------------------------------------
 
 @app.post("/ingest/{secret}")
+
 async def ingest(secret: str, request: Request):
 
-    if secret != INGEST_SECRET:
-
-        logger.warning("Intent amb secret incorrecte")
+    if secret != "massanet123":
 
         raise HTTPException(
             status_code=403,
-            detail="forbidden"
+            detail="Invalid secret"
         )
-
 
     body = await request.json()
 
+    meter_id = body["meter_id"]
 
-    meter_id = body.get("meter_id")
+    raw_value = float(body["value"])
 
     location = body.get("location")
 
-    value = body.get("value")
+    # get meter config
 
+    meter = get_meter(meter_id)
 
-    if meter_id is None or location is None or value is None:
+    # convert
 
-        raise HTTPException(
-            status_code=400,
-            detail="missing fields"
-        )
+    value = convert_value(raw_value, meter)
 
+    unit = meter.get("display_unit")
 
-    timestamp = datetime.datetime.utcnow().isoformat()
-
+    now = datetime.now(timezone.utc)
 
     row = {
+
+        "event_time": now.isoformat(),
 
         "meter_id": meter_id,
 
@@ -143,53 +164,26 @@ async def ingest(secret: str, request: Request):
 
         "value": value,
 
-        "timestamp": timestamp
+        "raw": str(raw_value),
+
+        "unit": unit
 
     }
 
+    insert_reading(row)
 
-    try:
+    return {
 
-        errors = bq.insert_rows_json(TABLE, [row])
+        "status": "inserted",
 
+        "meter_id": meter_id,
 
-        if errors:
+        "value": value,
 
-            logger.error(f"BigQuery errors: {errors}")
+        "unit": unit,
 
-            raise HTTPException(
-                status_code=500,
-                detail="bigquery insert error"
-            )
+        "timestamp": now.isoformat(),
 
+        "version": VERSION
 
-        logger.info(f"Insert OK: {meter_id} {value}")
-
-
-        return {
-
-            "status": "inserted",
-
-            "table_id": f"{DATASET_ID}.{TABLE_ID}",
-
-            "timestamp": timestamp,
-
-            "version": VERSION
-
-        }
-
-
-    except Exception as e:
-
-        logger.exception("Internal error")
-
-        raise HTTPException(
-            status_code=500,
-            detail="internal error"
-        )
-
-
-
-# ============================================================
-# END
-# ============================================================
+    }
