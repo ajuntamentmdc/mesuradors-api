@@ -3,7 +3,7 @@
 # main.py
 #
 # Version: 1.2.3
-# Date: 2026-02-22
+# Date: 2026-02-22 15:14
 #
 # Fix:
 # - Insert row keys aligned to the REAL BigQuery schema you have
