@@ -2,18 +2,22 @@
 # mesuradors-api
 # main.py
 #
-# Version: 1.1.0
+# Version: 1.2.0
 # Date: 2026-02-22
 #
-# SCALA READY VERSION
-# - Uses meters table
-# - Supports unit conversion
-# - Fully scalable architecture
+# SCALA FULL VERSION
+#
+# NEW:
+# - stores raw_value
+# - stores raw_unit
+# - stores raw_payload JSON
+# - stores group_id
+#
+# architecture ready for ALL sensors types
 # ============================================================
 
 import os
 from datetime import datetime, timezone
-
 from fastapi import FastAPI, Request, HTTPException
 from google.cloud import bigquery
 
@@ -27,7 +31,7 @@ DATASET_ID = os.getenv("DATASET_ID", "mesuradors")
 TABLE_READINGS = "readings"
 TABLE_METERS = "meters"
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ------------------------------------------------------------
 # INIT
@@ -91,6 +95,7 @@ def get_meter(meter_id):
     rows = list(job.result())
 
     if not rows:
+
         raise HTTPException(
             status_code=404,
             detail=f"Meter not found: {meter_id}"
@@ -103,16 +108,14 @@ def get_meter(meter_id):
 # INSERT
 # ------------------------------------------------------------
 
-def insert_reading(data):
+def insert_reading(row):
 
     table_id = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_READINGS}"
 
-    errors = bq.insert_rows_json(
-        table_id,
-        [data]
-    )
+    errors = bq.insert_rows_json(table_id, [row])
 
     if errors:
+
         raise HTTPException(
             status_code=500,
             detail=errors
@@ -142,17 +145,29 @@ async def ingest(secret: str, request: Request):
 
     location = body.get("location")
 
-    # get meter config
+    raw_unit = body.get("unit")
+
+    now = datetime.now(timezone.utc)
+
+    # --------------------------------------------------------
+    # meter config
+    # --------------------------------------------------------
 
     meter = get_meter(meter_id)
 
+    group_id = meter.get("group_id")
+
+    # --------------------------------------------------------
     # convert
+    # --------------------------------------------------------
 
     value = convert_value(raw_value, meter)
 
     unit = meter.get("display_unit")
 
-    now = datetime.now(timezone.utc)
+    # --------------------------------------------------------
+    # create row
+    # --------------------------------------------------------
 
     row = {
 
@@ -160,23 +175,35 @@ async def ingest(secret: str, request: Request):
 
         "meter_id": meter_id,
 
+        "group_id": group_id,
+
         "location": location,
+
+        "raw_value": raw_value,
+
+        "raw_unit": raw_unit,
 
         "value": value,
 
-        "raw": str(raw_value),
+        "unit": unit,
 
-        "unit": unit
+        "raw_payload": body
 
     }
 
     insert_reading(row)
+
+    # --------------------------------------------------------
+    # response
+    # --------------------------------------------------------
 
     return {
 
         "status": "inserted",
 
         "meter_id": meter_id,
+
+        "group_id": group_id,
 
         "value": value,
 
