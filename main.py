@@ -4,9 +4,6 @@
 #
 #  Project: mesuradors-mdc
 #  Dataset: mesuradors
-#  Tables:
-#    - mesuradors.meters
-#    - mesuradors.readings
 #
 #  Pipeline:
 #    DF555 (LoRaWAN) → ChirpStack → HTTP Webhook → Cloud Run → BigQuery → PWA
@@ -14,39 +11,29 @@
 # ------------------------------------------------------------
 #  VERSION
 # ------------------------------------------------------------
-#  Version: 1.2.9
-#  Date (UTC): 2026-02-22T22:00:00Z
+#  Version: 1.3.0
+#  Date (UTC): 2026-02-22T22:30:00Z
 #
 # ------------------------------------------------------------
 #  CHANGELOG
 # ------------------------------------------------------------
-#  1.2.9 (2026-02-22)
-#   - FIX (CRITICAL): scale_type="gasoil_linear" conversion corrected.
-#       Previous bug (1.2.7): divided by zm_sensor_cm (dead-zone margin) instead of usable height.
-#       New:
-#         usable_h = h_sensor_cm - zm_sensor_cm
-#         level_cm = clamp(h_sensor_cm - raw_cm, 0, usable_h)
-#         litres  = clamp((level_cm / usable_h) * litres_diposit, 0, litres_diposit)
+#  1.3.0 (2026-02-22)
+#   - FEATURE (READ API): Adds read-only endpoints for PWA:
+#       GET /v1/locations
+#       GET /v1/locations/{ubicacio}/estat
+#       GET /v1/estat (optional: all)
+#     Data source: BigQuery view `mesuradors.v_estat_scada`
 #
-#   - FEATURE: store DF555 telemetry fields into BigQuery:
-#       battery_v      (FLOAT64)
-#       temperature_c  (FLOAT64)
-#       tilt_deg       (FLOAT64)
-#
-#   - ROBUSTNESS: extract DF555 "object" from common ChirpStack wrappers:
-#       body.object / body.uplink.object / body.event.object
-#
-#   - ROBUSTNESS: ignore non-measurement ChirpStack events (event=join, event=status)
-#       Return 200 OK with {"status":"ignored"} to avoid noisy 400s in logs.
+#   - Keeps ingestion logic from 1.2.9:
+#       - Correct scale_type="gasoil_linear" conversion
+#       - Store battery_v / temperature_c / tilt_deg into readings table
+#       - Ignore event=join/status (200 OK ignored)
 #
 # ------------------------------------------------------------
-#  NOTES / PRINCIPLES
+#  NOTES
 # ------------------------------------------------------------
-#  - "raw" (STRING) ALWAYS stores full inbound payload JSON (auditable + recomputable).
-#  - "raw_payload" (JSON column) is kept as NULL by default to avoid schema mismatches.
-#    (If you want it later, set env RAW_PAYLOAD_MODE="json".)
-#  - Conversion rules are controlled by meters.scale_type (ex: gasoil_linear). :contentReference[oaicite:4]{index=4}
-#
+#  - v_estat_scada must exist in BigQuery (already created in this project).
+#  - CORS is open (*) for now; restrict later to https://mesuradors.massanet.cat
 # ============================================================
 
 import os
@@ -54,7 +41,7 @@ import json
 import logging
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -73,8 +60,12 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 # -----------------------------
 PROJECT_ID = os.getenv("PROJECT_ID", "mesuradors-mdc")
 DATASET_ID = os.getenv("DATASET_ID", "mesuradors")
+
 TABLE_METERS = os.getenv("TABLE_METERS", "meters")
 TABLE_READINGS = os.getenv("TABLE_READINGS", "readings")
+
+# BigQuery view used by the PWA endpoints
+VIEW_ESTAT_SCADA = os.getenv("VIEW_ESTAT_SCADA", "v_estat_scada")
 
 INGEST_SECRET = os.getenv("INGEST_SECRET", "massanet123")
 
@@ -87,15 +78,18 @@ CHS_DEVICE_MAP = {
     "nivell_gasoil_escola": "gasoil_escola",
 }
 
-VERSION = "1.2.9"
+VERSION = "1.3.0"
 
 
-def table_id(table_name: str) -> str:
-    return f"{PROJECT_ID}.{DATASET_ID}.{table_name}"
+def table_id(name: str) -> str:
+    return f"{PROJECT_ID}.{DATASET_ID}.{name}"
+
+
+def view_id(name: str) -> str:
+    return f"{PROJECT_ID}.{DATASET_ID}.{name}"
 
 
 def utc_now_iso() -> str:
-    # BigQuery insert_rows_json accepts timestamp as ISO8601 string
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -113,7 +107,6 @@ def _safe_float(x: Any) -> Optional[float]:
 # -----------------------------
 app = FastAPI(title="mesuradors-api", version=VERSION)
 
-# CORS (useful for Swagger + future PWA)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # later: restrict to https://mesuradors.massanet.cat
@@ -122,7 +115,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# BigQuery client
 bq = bigquery.Client(project=PROJECT_ID)
 
 
@@ -149,16 +141,9 @@ def get_meter_config(meter_id: str) -> Dict[str, Any]:
 
 
 # -----------------------------
-# DF555 / ChirpStack helpers
+# ChirpStack helpers (DF555 decoded object)
 # -----------------------------
 def extract_df555_object(body: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Robust extraction of DF555 decoded object.
-    Mirrors the robustness used in the "working" Apps Script:
-      - body.object
-      - body.uplink.object
-      - body.event.object
-    """
     if isinstance(body.get("object"), dict):
         return body["object"]
 
@@ -170,23 +155,16 @@ def extract_df555_object(body: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(event, dict) and isinstance(event.get("object"), dict):
         return event["object"]
 
-    # fallback empty
     return {}
 
 
 def extract_device_name(body: Dict[str, Any]) -> Optional[str]:
-    """
-    ChirpStack typical:
-      body.deviceInfo.deviceName
-    but keep it defensive.
-    """
     di = body.get("deviceInfo")
     if isinstance(di, dict):
         dn = di.get("deviceName")
         if isinstance(dn, str) and dn.strip():
             return dn.strip()
 
-    # some setups may provide deviceName directly
     dn2 = body.get("deviceName")
     if isinstance(dn2, str) and dn2.strip():
         return dn2.strip()
@@ -195,7 +173,6 @@ def extract_device_name(body: Dict[str, Any]) -> Optional[str]:
 
 
 def extract_uplink_id(body: Dict[str, Any]) -> Optional[str]:
-    # optional, not always present
     for k in ("uplinkID", "uplinkId", "uplink_id"):
         v = body.get(k)
         if isinstance(v, str) and v.strip():
@@ -228,46 +205,35 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def convert_value(raw_value: float, raw_unit: Optional[str], meter: Dict[str, Any]) -> Tuple[float, Optional[str]]:
-    """
-    Returns: (value, display_unit)
-    """
     scale_type = meter.get("scale_type")
     display_unit = meter.get("display_unit")
 
-    # Default: pass-through
     if not scale_type:
         return float(raw_value), display_unit
 
-    # IMPORTANT: this is the exact scale_type you have configured in BigQuery meters table. :contentReference[oaicite:5]{index=5}
+    # This is the configured scale_type in mesuradors.meters (e.g., gasoil_linear).
     if scale_type == "gasoil_linear":
-        # expects (from meters table):
-        # h_sensor_cm, zm_sensor_cm, litres_diposit
         h = meter.get("h_sensor_cm")
         z = meter.get("zm_sensor_cm")
         litres = meter.get("litres_diposit")
 
         if h is None or z is None or litres is None:
-            # fallback, do not break ingestion
             return float(raw_value), display_unit
 
         raw_cm = _distance_to_cm(float(raw_value), raw_unit)
 
-        # usable height = total height - dead-zone margin
         usable_h = float(h) - float(z)
         if usable_h <= 0:
             return float(raw_value), display_unit
 
-        # liquid level (cm) from bottom reference
         level_cm = float(h) - raw_cm
         level_cm = _clamp(level_cm, 0.0, usable_h)
 
-        # litres proportional to usable height
         value_l = (level_cm / usable_h) * float(litres)
         value_l = _clamp(value_l, 0.0, float(litres))
 
         return round(float(value_l), 3), display_unit
 
-    # Unknown scale_type: pass-through
     return float(raw_value), display_unit
 
 
@@ -281,9 +247,6 @@ def insert_reading(row: Dict[str, Any]) -> None:
         raise HTTPException(status_code=500, detail={"bq_errors": errors})
 
 
-# -----------------------------
-# CORE INGEST
-# -----------------------------
 def ingest_core(
     meter_id: str,
     raw_value: float,
@@ -301,26 +264,21 @@ def ingest_core(
 
     value, display_unit = convert_value(raw_value, raw_unit, meter)
 
-    # Always store full payload in `raw` (STRING)
     raw_payload_str = json.dumps(raw_payload_obj, ensure_ascii=False)
-
-    # Keep raw_payload NULL by default (avoid schema mismatch issues).
     raw_payload_for_bq = raw_payload_obj if RAW_PAYLOAD_MODE == "json" else None
 
     row = {
-        "event_time": utc_now_iso(),          # TIMESTAMP (string ISO ok)
-        "meter_id": meter_id,                # required
-        "location": location,                # nullable
-        "value": float(value),               # required
-        "raw": raw_payload_str,              # nullable STRING
-        "uplink_id": uplink_id,              # nullable
-        "unit": display_unit,                # nullable (display unit)
-        "raw_value": float(raw_value),       # nullable
-        "raw_unit": raw_unit,                # nullable (raw unit)
-        "raw_payload": raw_payload_for_bq,   # JSON column optional
-        "group_id": group_id,                # nullable
-
-        # NEW telemetry fields (already added to BQ by you)
+        "event_time": utc_now_iso(),
+        "meter_id": meter_id,
+        "location": location,
+        "value": float(value),
+        "raw": raw_payload_str,
+        "uplink_id": uplink_id,
+        "unit": display_unit,
+        "raw_value": float(raw_value),
+        "raw_unit": raw_unit,
+        "raw_payload": raw_payload_for_bq,
+        "group_id": group_id,
         "battery_v": battery_v,
         "temperature_c": temperature_c,
         "tilt_deg": tilt_deg,
@@ -358,6 +316,67 @@ def ingest_core(
 
 
 # -----------------------------
+# READ API (PWA)
+# -----------------------------
+def bq_rows_to_dicts(rows) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        # Make TIMESTAMP JSON-friendly (ISO)
+        ts = d.get("ultima_lectura")
+        if ts is not None:
+            try:
+                d["ultima_lectura"] = ts.isoformat()
+            except Exception:
+                pass
+        out.append(d)
+    return out
+
+
+@app.get("/v1/locations")
+def list_locations():
+    q = f"""
+    SELECT DISTINCT ubicacio
+    FROM `{view_id(VIEW_ESTAT_SCADA)}`
+    WHERE ubicacio IS NOT NULL
+    ORDER BY ubicacio
+    """
+    rows = bq.query(q).result()
+    return {"locations": [dict(r)["ubicacio"] for r in rows], "version": VERSION}
+
+
+@app.get("/v1/locations/{ubicacio}/estat")
+def estat_by_location(ubicacio: str):
+    q = f"""
+    SELECT
+      ubicacio, sensor, rang, v_act, unit, pct, estat, ultima_lectura
+    FROM `{view_id(VIEW_ESTAT_SCADA)}`
+    WHERE ubicacio = @ubicacio
+    ORDER BY sensor
+    """
+    job = bq.query(
+        q,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("ubicacio", "STRING", ubicacio)]
+        ),
+    )
+    rows = list(job.result())
+    return {"ubicacio": ubicacio, "rows": bq_rows_to_dicts(rows), "version": VERSION}
+
+
+@app.get("/v1/estat")
+def estat_all():
+    q = f"""
+    SELECT
+      ubicacio, sensor, rang, v_act, unit, pct, estat, ultima_lectura
+    FROM `{view_id(VIEW_ESTAT_SCADA)}`
+    ORDER BY ubicacio, sensor
+    """
+    rows = bq.query(q).result()
+    return {"rows": bq_rows_to_dicts(rows), "version": VERSION}
+
+
+# -----------------------------
 # ROUTES
 # -----------------------------
 @app.get("/")
@@ -374,8 +393,10 @@ def health():
         "dataset": DATASET_ID,
         "table_readings": TABLE_READINGS,
         "table_meters": TABLE_METERS,
-        "table_id_readings": table_id(TABLE_READINGS),
-        "table_id_meters": table_id(TABLE_METERS),
+        "view_estat_scada": VIEW_ESTAT_SCADA,
+        "id_readings": table_id(TABLE_READINGS),
+        "id_meters": table_id(TABLE_METERS),
+        "id_view_estat_scada": view_id(VIEW_ESTAT_SCADA),
         "secret_env_present": bool(os.getenv("INGEST_SECRET")),
         "raw_payload_mode": RAW_PAYLOAD_MODE,
     }
@@ -383,17 +404,6 @@ def health():
 
 @app.post("/ingest/{secret}")
 async def ingest(secret: str, request: Request):
-    """
-    Generic ingest.
-    Expected JSON (minimum):
-      {
-        "meter_id": "...",
-        "value": 123.4,
-        "unit": "mm" | "cm" | "L" | ...
-        "location": "optional",
-        "uplink_id": "optional"
-      }
-    """
     if secret != INGEST_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
@@ -418,7 +428,6 @@ async def ingest(secret: str, request: Request):
     location = body.get("location")
     uplink_id = body.get("uplink_id")
 
-    # optional telemetry in generic ingest
     battery_v = _safe_float(body.get("battery_v"))
     temperature_c = _safe_float(body.get("temperature_c"))
     tilt_deg = _safe_float(body.get("tilt_deg"))
@@ -452,17 +461,6 @@ async def ingest(secret: str, request: Request):
 
 @app.post("/ingest_chs/{secret}")
 async def ingest_chs(secret: str, request: Request, body: Dict[str, Any] = Body(...)):
-    """
-    ChirpStack adapter.
-    Webhook URL example:
-      https://.../ingest_chs/massanet123?event=up
-
-    We only ingest when:
-      - event=up (or no event provided)
-      - DF555 decoded object contains object.distancia_mm
-
-    Non-measurement events (event=join/status) are ignored with 200 OK to avoid log noise.
-    """
     if secret != INGEST_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
@@ -479,13 +477,10 @@ async def ingest_chs(secret: str, request: Request, body: Dict[str, Any] = Body(
 
         obj = extract_df555_object(body)
 
-        # DF555 key names expected from your formatter:
-        # distancia_mm, bateria_V, temperatura_C, inclinacio_deg
         distancia_mm = obj.get("distancia_mm")
         if distancia_mm is None:
             return {"status": "ignored", "reason": "missing object.distancia_mm", "meter_id": meter_id, "version": VERSION}
 
-        # Telemetry fields (optional)
         battery_v = _safe_float(obj.get("bateria_V"))
         temperature_c = _safe_float(obj.get("temperatura_C"))
         tilt_deg = _safe_float(obj.get("inclinacio_deg"))
