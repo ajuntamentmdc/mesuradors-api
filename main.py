@@ -1,63 +1,58 @@
 # ============================================================
-# mesuradors-api — main.py
+#  mesuradors-api — main.py
+# ============================================================
 #
-# Version: 1.2.8
-# Release date (UTC): 2026-02-22T21:30:00Z
+#  Project: mesuradors-mdc
+#  Dataset: mesuradors
+#  Tables:
+#    - mesuradors.meters
+#    - mesuradors.readings
 #
-# CHANGELOG (1.2.8)
-# - FIX (CRITICAL): Correct conversion for scale_type="gasoil_linear"
-#   - Previous bug: value_l = (level_cm / zm_sensor_cm) * litres_diposit
-#     This could generate absurd values (e.g., 29,000 L for a 2,000 L tank),
-#     because zm_sensor_cm is the dead-zone margin, NOT the usable height.
-#   - New formula:
-#       usable_h = h_sensor_cm - zm_sensor_cm
-#       level_cm = clamp(h_sensor_cm - raw_cm, 0, usable_h)
-#       value_l  = clamp((level_cm / usable_h) * litres_diposit, 0, litres_diposit)
+#  Pipeline:
+#    DF555 (LoRaWAN) → ChirpStack → HTTP Webhook → Cloud Run → BigQuery → PWA
 #
-# - IMPROVEMENT: ChirpStack adapter now gracefully ignores non-measurement events
-#   (event=join, event=status, report_type=0x03, etc.) by returning 200 OK
-#   instead of 400, to avoid log noise and confusion.
+# ------------------------------------------------------------
+#  VERSION
+# ------------------------------------------------------------
+#  Version: 1.2.9
+#  Date (UTC): 2026-02-22T22:00:00Z
 #
-# - OBSERVABILITY: Adds structured diagnostic fields in responses and logs.
+# ------------------------------------------------------------
+#  CHANGELOG
+# ------------------------------------------------------------
+#  1.2.9 (2026-02-22)
+#   - FIX (CRITICAL): scale_type="gasoil_linear" conversion corrected.
+#       Previous bug (1.2.7): divided by zm_sensor_cm (dead-zone margin) instead of usable height.
+#       New:
+#         usable_h = h_sensor_cm - zm_sensor_cm
+#         level_cm = clamp(h_sensor_cm - raw_cm, 0, usable_h)
+#         litres  = clamp((level_cm / usable_h) * litres_diposit, 0, litres_diposit)
 #
-# CONSIGNES (kept)
-# - FastAPI on Cloud Run
-# - Endpoints:
-#   - GET  /health
-#   - POST /ingest/{secret}       (generic)
-#   - POST /ingest_chs/{secret}   (ChirpStack adapter)
-# - BigQuery:
-#   - Read meter config from `mesuradors.meters`
-#   - Write readings to `mesuradors.readings`
-#   - Align to schema:
-#       event_time   TIMESTAMP (REQUIRED)
-#       meter_id     STRING    (REQUIRED)
-#       location     STRING    (NULLABLE)
-#       value        FLOAT     (REQUIRED)
-#       raw          STRING    (NULLABLE)   <-- full payload JSON string
-#       uplink_id    STRING    (NULLABLE)
-#       unit         STRING    (NULLABLE)
-#       raw_value    FLOAT     (NULLABLE)
-#       raw_unit     STRING    (NULLABLE)
-#       raw_payload  JSON      (NULLABLE)   <-- optional; see note below
-#       group_id     STRING    (NULLABLE)
+#   - FEATURE: store DF555 telemetry fields into BigQuery:
+#       battery_v      (FLOAT64)
+#       temperature_c  (FLOAT64)
+#       tilt_deg       (FLOAT64)
 #
-# NOTE ABOUT raw_payload
-# - Earlier deployments saw BigQuery insert errors ("raw_payload is not a record").
-# - To ensure ingestion never breaks, we ALWAYS store full payload into `raw` (STRING).
-# - We only fill `raw_payload` if explicitly enabled (env RAW_PAYLOAD_MODE="json").
-#   Otherwise raw_payload is set to None.
+#   - ROBUSTNESS: extract DF555 "object" from common ChirpStack wrappers:
+#       body.object / body.uplink.object / body.event.object
 #
-# REFERENCES (project context)
-# - DF555 protocol formatter exposes object.distancia_mm, temperatura, inclinacio, alarms, etc.
-# - Historical "working" Apps Script wrote distance (cm) to Sheets and used sheet formulas
-#   for liters/%; this service computes liters directly for BigQuery.
+#   - ROBUSTNESS: ignore non-measurement ChirpStack events (event=join, event=status)
+#       Return 200 OK with {"status":"ignored"} to avoid noisy 400s in logs.
+#
+# ------------------------------------------------------------
+#  NOTES / PRINCIPLES
+# ------------------------------------------------------------
+#  - "raw" (STRING) ALWAYS stores full inbound payload JSON (auditable + recomputable).
+#  - "raw_payload" (JSON column) is kept as NULL by default to avoid schema mismatches.
+#    (If you want it later, set env RAW_PAYLOAD_MODE="json".)
+#  - Conversion rules are controlled by meters.scale_type (ex: gasoil_linear). :contentReference[oaicite:4]{index=4}
+#
 # ============================================================
 
 import os
 import json
-import traceback
 import logging
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -83,8 +78,8 @@ TABLE_READINGS = os.getenv("TABLE_READINGS", "readings")
 
 INGEST_SECRET = os.getenv("INGEST_SECRET", "massanet123")
 
-# If set to "json", we will attempt to also populate BigQuery JSON column raw_payload.
-# Default is "off" (store raw JSON string in 'raw' and set raw_payload=None).
+# If set to "json", we also attempt to store dict payload in BigQuery JSON column raw_payload.
+# Default "off": always store JSON payload into `raw` (STRING), raw_payload = None.
 RAW_PAYLOAD_MODE = os.getenv("RAW_PAYLOAD_MODE", "off").strip().lower()  # "off" | "json"
 
 # Optional: strict mapping for known CHS deviceName -> meter_id
@@ -92,7 +87,7 @@ CHS_DEVICE_MAP = {
     "nivell_gasoil_escola": "gasoil_escola",
 }
 
-VERSION = "1.2.8"
+VERSION = "1.2.9"
 
 
 def table_id(table_name: str) -> str:
@@ -104,15 +99,24 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _safe_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
 # -----------------------------
 # APP
 # -----------------------------
 app = FastAPI(title="mesuradors-api", version=VERSION)
 
-# CORS (Swagger "Try it out" + future PWA)
+# CORS (useful for Swagger + future PWA)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict later (e.g. https://mesuradors.massanet.cat)
+    allow_origins=["*"],  # later: restrict to https://mesuradors.massanet.cat
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -145,13 +149,64 @@ def get_meter_config(meter_id: str) -> Dict[str, Any]:
 
 
 # -----------------------------
-# CONVERSION HELPERS
+# DF555 / ChirpStack helpers
+# -----------------------------
+def extract_df555_object(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Robust extraction of DF555 decoded object.
+    Mirrors the robustness used in the "working" Apps Script:
+      - body.object
+      - body.uplink.object
+      - body.event.object
+    """
+    if isinstance(body.get("object"), dict):
+        return body["object"]
+
+    uplink = body.get("uplink")
+    if isinstance(uplink, dict) and isinstance(uplink.get("object"), dict):
+        return uplink["object"]
+
+    event = body.get("event")
+    if isinstance(event, dict) and isinstance(event.get("object"), dict):
+        return event["object"]
+
+    # fallback empty
+    return {}
+
+
+def extract_device_name(body: Dict[str, Any]) -> Optional[str]:
+    """
+    ChirpStack typical:
+      body.deviceInfo.deviceName
+    but keep it defensive.
+    """
+    di = body.get("deviceInfo")
+    if isinstance(di, dict):
+        dn = di.get("deviceName")
+        if isinstance(dn, str) and dn.strip():
+            return dn.strip()
+
+    # some setups may provide deviceName directly
+    dn2 = body.get("deviceName")
+    if isinstance(dn2, str) and dn2.strip():
+        return dn2.strip()
+
+    return None
+
+
+def extract_uplink_id(body: Dict[str, Any]) -> Optional[str]:
+    # optional, not always present
+    for k in ("uplinkID", "uplinkId", "uplink_id"):
+        v = body.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+# -----------------------------
+# CONVERSION
 # -----------------------------
 def _distance_to_cm(value: float, unit: Optional[str]) -> float:
-    """
-    Convert a distance to centimeters.
-    Expected raw units for DF555 distance are mm.
-    """
     if unit is None:
         return value
     u = unit.strip().lower()
@@ -161,7 +216,6 @@ def _distance_to_cm(value: float, unit: Optional[str]) -> float:
         return value
     if u == "m":
         return value * 100.0
-    # unknown => pass-through
     return value
 
 
@@ -173,73 +227,48 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return x
 
 
-def convert_value(raw_value: float, raw_unit: Optional[str], meter: Dict[str, Any]) -> Tuple[float, Optional[str], Dict[str, Any]]:
+def convert_value(raw_value: float, raw_unit: Optional[str], meter: Dict[str, Any]) -> Tuple[float, Optional[str]]:
     """
-    Returns: (value, display_unit, debug)
-    debug contains intermediate values for troubleshooting.
+    Returns: (value, display_unit)
     """
-    scale_type = (meter.get("scale_type") or "").strip()
+    scale_type = meter.get("scale_type")
     display_unit = meter.get("display_unit")
-    debug: Dict[str, Any] = {
-        "scale_type": scale_type or None,
-        "raw_value": raw_value,
-        "raw_unit": raw_unit,
-    }
 
     # Default: pass-through
     if not scale_type:
-        return float(raw_value), display_unit, debug
+        return float(raw_value), display_unit
 
-    # --- Correct implementation for gasoil_linear ---
-    # The meters table provides:
-    # - litres_diposit : total tank capacity in liters
-    # - h_sensor_cm    : distance from sensor to tank bottom reference (cm)
-    # - zm_sensor_cm   : dead-zone margin near bottom (cm) not usable for measurement
-    #
-    # Sensor provides:
-    # - distancia_mm: "air height" from sensor to liquid surface (mm)
-    #
-    # Compute:
-    #   raw_cm = distancia_mm/10
-    #   usable_h = h - z
-    #   level_cm = clamp(h - raw_cm, 0, usable_h)
-    #   value_l = clamp((level_cm / usable_h) * litres, 0, litres)
-    #
+    # IMPORTANT: this is the exact scale_type you have configured in BigQuery meters table. :contentReference[oaicite:5]{index=5}
     if scale_type == "gasoil_linear":
+        # expects (from meters table):
+        # h_sensor_cm, zm_sensor_cm, litres_diposit
         h = meter.get("h_sensor_cm")
         z = meter.get("zm_sensor_cm")
         litres = meter.get("litres_diposit")
 
-        debug.update({"h_sensor_cm": h, "zm_sensor_cm": z, "litres_diposit": litres})
-
         if h is None or z is None or litres is None:
             # fallback, do not break ingestion
-            debug["fallback_reason"] = "missing_meter_params"
-            return float(raw_value), display_unit, debug
+            return float(raw_value), display_unit
 
         raw_cm = _distance_to_cm(float(raw_value), raw_unit)
+
+        # usable height = total height - dead-zone margin
         usable_h = float(h) - float(z)
-
-        debug.update({"raw_cm": raw_cm, "usable_h_cm": usable_h})
-
         if usable_h <= 0:
-            debug["fallback_reason"] = "invalid_usable_height"
-            return float(raw_value), display_unit, debug
+            return float(raw_value), display_unit
 
-        # level height of liquid from bottom reference (cm)
+        # liquid level (cm) from bottom reference
         level_cm = float(h) - raw_cm
         level_cm = _clamp(level_cm, 0.0, usable_h)
 
+        # litres proportional to usable height
         value_l = (level_cm / usable_h) * float(litres)
         value_l = _clamp(value_l, 0.0, float(litres))
 
-        debug.update({"level_cm": level_cm, "value_l": value_l})
-
-        return round(float(value_l), 3), display_unit, debug
+        return round(float(value_l), 3), display_unit
 
     # Unknown scale_type: pass-through
-    debug["fallback_reason"] = "unknown_scale_type"
-    return float(raw_value), display_unit, debug
+    return float(raw_value), display_unit
 
 
 # -----------------------------
@@ -262,40 +291,54 @@ def ingest_core(
     location: Optional[str],
     raw_payload_obj: Dict[str, Any],
     uplink_id: Optional[str] = None,
+    battery_v: Optional[float] = None,
+    temperature_c: Optional[float] = None,
+    tilt_deg: Optional[float] = None,
 ) -> Dict[str, Any]:
 
     meter = get_meter_config(meter_id)
     group_id = meter.get("group_id")
 
-    value, display_unit, debug = convert_value(raw_value, raw_unit, meter)
+    value, display_unit = convert_value(raw_value, raw_unit, meter)
 
-    # Always store full payload in 'raw' as JSON string
+    # Always store full payload in `raw` (STRING)
     raw_payload_str = json.dumps(raw_payload_obj, ensure_ascii=False)
 
-    # raw_payload handling:
-    # - If RAW_PAYLOAD_MODE="json", try to store as JSON as well.
-    # - Else keep None to avoid schema mismatch failures.
+    # Keep raw_payload NULL by default (avoid schema mismatch issues).
     raw_payload_for_bq = raw_payload_obj if RAW_PAYLOAD_MODE == "json" else None
 
     row = {
-        "event_time": utc_now_iso(),     # TIMESTAMP (ISO string OK)
-        "meter_id": meter_id,
-        "location": location,           # nullable
-        "value": float(value),
-        "raw": raw_payload_str,         # nullable STRING -> keep full payload here
-        "uplink_id": uplink_id,         # nullable
-        "unit": display_unit,           # nullable
-        "raw_value": float(raw_value),  # nullable
-        "raw_unit": raw_unit,           # nullable
-        "raw_payload": raw_payload_for_bq,
-        "group_id": group_id,           # nullable
+        "event_time": utc_now_iso(),          # TIMESTAMP (string ISO ok)
+        "meter_id": meter_id,                # required
+        "location": location,                # nullable
+        "value": float(value),               # required
+        "raw": raw_payload_str,              # nullable STRING
+        "uplink_id": uplink_id,              # nullable
+        "unit": display_unit,                # nullable (display unit)
+        "raw_value": float(raw_value),       # nullable
+        "raw_unit": raw_unit,                # nullable (raw unit)
+        "raw_payload": raw_payload_for_bq,   # JSON column optional
+        "group_id": group_id,                # nullable
+
+        # NEW telemetry fields (already added to BQ by you)
+        "battery_v": battery_v,
+        "temperature_c": temperature_c,
+        "tilt_deg": tilt_deg,
     }
 
     insert_reading(row)
 
     logger.info(
-        "Inserted reading meter_id=%s value=%s unit=%s raw_value=%s raw_unit=%s",
-        meter_id, value, display_unit, raw_value, raw_unit
+        "Inserted reading meter_id=%s raw=%s%s value=%s%s bat=%s temp=%s tilt=%s v=%s",
+        meter_id,
+        raw_value,
+        f" {raw_unit}" if raw_unit else "",
+        value,
+        f" {display_unit}" if display_unit else "",
+        battery_v,
+        temperature_c,
+        tilt_deg,
+        VERSION,
     )
 
     return {
@@ -306,10 +349,11 @@ def ingest_core(
         "raw_unit": raw_unit,
         "value": float(value),
         "unit": display_unit,
+        "battery_v": battery_v,
+        "temperature_c": temperature_c,
+        "tilt_deg": tilt_deg,
         "table_id": table_id(TABLE_READINGS),
         "version": VERSION,
-        "debug": debug,
-        "raw_payload_mode": RAW_PAYLOAD_MODE,
     }
 
 
@@ -374,6 +418,11 @@ async def ingest(secret: str, request: Request):
     location = body.get("location")
     uplink_id = body.get("uplink_id")
 
+    # optional telemetry in generic ingest
+    battery_v = _safe_float(body.get("battery_v"))
+    temperature_c = _safe_float(body.get("temperature_c"))
+    tilt_deg = _safe_float(body.get("tilt_deg"))
+
     try:
         return ingest_core(
             meter_id=str(meter_id),
@@ -382,6 +431,9 @@ async def ingest(secret: str, request: Request):
             location=location,
             raw_payload_obj=body,
             uplink_id=uplink_id,
+            battery_v=battery_v,
+            temperature_c=temperature_c,
+            tilt_deg=tilt_deg,
         )
     except HTTPException:
         raise
@@ -402,48 +454,45 @@ async def ingest(secret: str, request: Request):
 async def ingest_chs(secret: str, request: Request, body: Dict[str, Any] = Body(...)):
     """
     ChirpStack adapter.
+    Webhook URL example:
+      https://.../ingest_chs/massanet123?event=up
 
-    Supported minimal payload (as produced by our DF555 formatter):
-      {
-        "deviceInfo": { "deviceName": "nivell_gasoil_escola" },
-        "object": { "distancia_mm": 350, ... }
-      }
+    We only ingest when:
+      - event=up (or no event provided)
+      - DF555 decoded object contains object.distancia_mm
 
-    ChirpStack also calls this webhook with query param:
-      ?event=up | ?event=join | ?event=status
-
-    Strategy:
-    - event=up: ingest if distancia_mm exists
-    - other events: return 200 OK with status="ignored"
+    Non-measurement events (event=join/status) are ignored with 200 OK to avoid log noise.
     """
     if secret != INGEST_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    event = request.query_params.get("event")  # "up", "join", "status", ...
+    event = request.query_params.get("event")  # up / join / status / ...
     if event and event != "up":
-        # ignore non-measurement events (avoid 400 noise)
         return {"status": "ignored", "reason": f"event={event}", "version": VERSION}
 
     try:
-        device_name = (body.get("deviceInfo") or {}).get("deviceName")
+        device_name = extract_device_name(body)
         if not device_name:
-            # If missing, we cannot map the meter reliably.
             return {"status": "ignored", "reason": "missing deviceInfo.deviceName", "version": VERSION}
 
         meter_id = CHS_DEVICE_MAP.get(device_name, device_name)
 
-        obj = body.get("object") or {}
-        distancia_mm = obj.get("distancia_mm")
+        obj = extract_df555_object(body)
 
-        # Some frames may be confirm/config (report_type 0x03) => no distance
+        # DF555 key names expected from your formatter:
+        # distancia_mm, bateria_V, temperatura_C, inclinacio_deg
+        distancia_mm = obj.get("distancia_mm")
         if distancia_mm is None:
             return {"status": "ignored", "reason": "missing object.distancia_mm", "meter_id": meter_id, "version": VERSION}
 
+        # Telemetry fields (optional)
+        battery_v = _safe_float(obj.get("bateria_V"))
+        temperature_c = _safe_float(obj.get("temperatura_C"))
+        tilt_deg = _safe_float(obj.get("inclinacio_deg"))
+
         raw_value = float(distancia_mm)
         raw_unit = "mm"
-
-        # optional uplink id
-        uplink_id = body.get("uplinkID") or body.get("uplink_id") or body.get("uplinkId")
+        uplink_id = extract_uplink_id(body)
 
         return ingest_core(
             meter_id=meter_id,
@@ -452,6 +501,9 @@ async def ingest_chs(secret: str, request: Request, body: Dict[str, Any] = Body(
             location=None,
             raw_payload_obj=body,
             uplink_id=uplink_id,
+            battery_v=battery_v,
+            temperature_c=temperature_c,
+            tilt_deg=tilt_deg,
         )
 
     except HTTPException:
