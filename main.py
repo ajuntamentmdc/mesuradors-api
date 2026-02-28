@@ -11,23 +11,27 @@
 # ------------------------------------------------------------
 #  VERSION
 # ------------------------------------------------------------
-#  Version: 1.3.0
-#  Date (UTC): 2026-02-22T22:30:00Z
+#  Version: 1.3.1
+#  Date (UTC): 2026-02-28T00:00:00Z
 #
 # ------------------------------------------------------------
 #  CHANGELOG
 # ------------------------------------------------------------
+#  1.3.1 (2026-02-28)
+#   - FIX (INGEST): Accepts DF555 decoded field names from ChirpStack `object`:
+#       - temperature_c: accepts `temperatura_C` OR `temperatura`
+#       - tilt_deg: accepts `inclinacio_deg` OR `inclinacio_graus`
+#       - battery_v: accepts `bateria_V` OR (`voltatge`/`voltage`/`vbat`) when present; otherwise NULL
+#     This fixes NULL telemetry fields in BigQuery while keeping schema unchanged.
+#   - DIAG: Logs DF555 object keys when optional telemetry is missing.
+#
 #  1.3.0 (2026-02-22)
 #   - FEATURE (READ API): Adds read-only endpoints for PWA:
 #       GET /v1/locations
 #       GET /v1/locations/{ubicacio}/estat
 #       GET /v1/estat (optional: all)
 #     Data source: BigQuery view `mesuradors.v_estat_scada`
-#
-#   - Keeps ingestion logic from 1.2.9:
-#       - Correct scale_type="gasoil_linear" conversion
-#       - Store battery_v / temperature_c / tilt_deg into readings table
-#       - Ignore event=join/status (200 OK ignored)
+#   - Keeps ingestion logic from 1.2.9 (gasoil_linear conversion; ignore join/status).
 #
 # ------------------------------------------------------------
 #  NOTES
@@ -78,7 +82,7 @@ CHS_DEVICE_MAP = {
     "nivell_gasoil_escola": "gasoil_escola",
 }
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 
 def table_id(name: str) -> str:
@@ -316,13 +320,116 @@ def ingest_core(
 
 
 # -----------------------------
+# ROUTES
+# -----------------------------
+@app.get("/")
+def root():
+    return {"ok": True, "service": "mesuradors-api", "version": VERSION}
+
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "version": VERSION,
+        "project": PROJECT_ID,
+        "dataset": DATASET_ID,
+        "table_readings": table_id(TABLE_READINGS),
+    }
+
+
+@app.post("/ingest_chs/{secret}")
+async def ingest_chs(secret: str, request: Request, body: Dict[str, Any] = Body(...)):
+    if secret != INGEST_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+
+    event = request.query_params.get("event")  # up / join / status / ...
+    if event and event != "up":
+        return {"status": "ignored", "reason": f"event={event}", "version": VERSION}
+
+    try:
+        device_name = extract_device_name(body)
+        if not device_name:
+            return {"status": "ignored", "reason": "missing deviceInfo.deviceName", "version": VERSION}
+
+        meter_id = CHS_DEVICE_MAP.get(device_name, device_name)
+
+        obj = extract_df555_object(body)
+
+        distancia_mm = obj.get("distancia_mm")
+        if distancia_mm is None:
+            return {"status": "ignored", "reason": "missing object.distancia_mm", "meter_id": meter_id, "version": VERSION}
+
+        # Telemetry fields (optional). DF555 decoders/formatters vary by key name.
+        # We accept both naming conventions:
+        #   - bateria_V / temperatura_C / inclinacio_deg
+        #   - temperatura / inclinacio_graus (seen in current ChirpStack object)
+        battery_v = _safe_float(
+            obj.get("bateria_V")
+            or obj.get("voltatge")
+            or obj.get("voltage")
+            or obj.get("vbat")
+        )
+
+        temperature_c = _safe_float(obj.get("temperatura_C"))
+        if temperature_c is None:
+            temperature_c = _safe_float(obj.get("temperatura"))
+
+        tilt_deg = _safe_float(obj.get("inclinacio_deg"))
+        if tilt_deg is None:
+            tilt_deg = _safe_float(obj.get("inclinacio_graus"))
+
+        # Helpful diagnostics (won't break ingestion)
+        if (battery_v is None) or (temperature_c is None) or (tilt_deg is None):
+            try:
+                logger.info(
+                    "DF555 optional telemetry missing (bat=%s temp=%s tilt=%s). object keys=%s",
+                    battery_v,
+                    temperature_c,
+                    tilt_deg,
+                    sorted(list(obj.keys())) if isinstance(obj, dict) else None,
+                )
+            except Exception:
+                pass
+
+        raw_value = float(distancia_mm)
+        raw_unit = "mm"
+        uplink_id = extract_uplink_id(body)
+
+        return ingest_core(
+            meter_id=meter_id,
+            raw_value=raw_value,
+            raw_unit=raw_unit,
+            location=None,
+            raw_payload_obj=body,
+            uplink_id=uplink_id,
+            battery_v=battery_v,
+            temperature_c=temperature_c,
+            tilt_deg=tilt_deg,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Unhandled exception in /ingest_chs: %s", str(e))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Unhandled exception in /ingest_chs",
+                "message": str(e),
+                "trace": traceback.format_exc(),
+                "version": VERSION,
+            },
+        )
+
+
+# -----------------------------
 # READ API (PWA)
 # -----------------------------
 def bq_rows_to_dicts(rows) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r)
-        # Make TIMESTAMP JSON-friendly (ISO)
         ts = d.get("ultima_lectura")
         if ts is not None:
             try:
@@ -372,145 +479,5 @@ def estat_all():
     FROM `{view_id(VIEW_ESTAT_SCADA)}`
     ORDER BY ubicacio, sensor
     """
-    rows = bq.query(q).result()
+    rows = list(bq.query(q).result())
     return {"rows": bq_rows_to_dicts(rows), "version": VERSION}
-
-
-# -----------------------------
-# ROUTES
-# -----------------------------
-@app.get("/")
-def root():
-    return {"ok": True, "service": "mesuradors-api", "version": VERSION}
-
-
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "version": VERSION,
-        "project": PROJECT_ID,
-        "dataset": DATASET_ID,
-        "table_readings": TABLE_READINGS,
-        "table_meters": TABLE_METERS,
-        "view_estat_scada": VIEW_ESTAT_SCADA,
-        "id_readings": table_id(TABLE_READINGS),
-        "id_meters": table_id(TABLE_METERS),
-        "id_view_estat_scada": view_id(VIEW_ESTAT_SCADA),
-        "secret_env_present": bool(os.getenv("INGEST_SECRET")),
-        "raw_payload_mode": RAW_PAYLOAD_MODE,
-    }
-
-
-@app.post("/ingest/{secret}")
-async def ingest(secret: str, request: Request):
-    if secret != INGEST_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid secret")
-
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-
-    meter_id = body.get("meter_id")
-    if not meter_id:
-        raise HTTPException(status_code=400, detail="Missing field: meter_id")
-
-    if "value" not in body:
-        raise HTTPException(status_code=400, detail="Missing field: value")
-
-    try:
-        raw_value = float(body["value"])
-    except Exception:
-        raise HTTPException(status_code=400, detail="Field value must be a number")
-
-    raw_unit = body.get("unit")
-    location = body.get("location")
-    uplink_id = body.get("uplink_id")
-
-    battery_v = _safe_float(body.get("battery_v"))
-    temperature_c = _safe_float(body.get("temperature_c"))
-    tilt_deg = _safe_float(body.get("tilt_deg"))
-
-    try:
-        return ingest_core(
-            meter_id=str(meter_id),
-            raw_value=raw_value,
-            raw_unit=raw_unit,
-            location=location,
-            raw_payload_obj=body,
-            uplink_id=uplink_id,
-            battery_v=battery_v,
-            temperature_c=temperature_c,
-            tilt_deg=tilt_deg,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Unhandled exception in /ingest: %s", str(e))
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "Unhandled exception in /ingest",
-                "message": str(e),
-                "trace": traceback.format_exc(),
-                "version": VERSION,
-            },
-        )
-
-
-@app.post("/ingest_chs/{secret}")
-async def ingest_chs(secret: str, request: Request, body: Dict[str, Any] = Body(...)):
-    if secret != INGEST_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid secret")
-
-    event = request.query_params.get("event")  # up / join / status / ...
-    if event and event != "up":
-        return {"status": "ignored", "reason": f"event={event}", "version": VERSION}
-
-    try:
-        device_name = extract_device_name(body)
-        if not device_name:
-            return {"status": "ignored", "reason": "missing deviceInfo.deviceName", "version": VERSION}
-
-        meter_id = CHS_DEVICE_MAP.get(device_name, device_name)
-
-        obj = extract_df555_object(body)
-
-        distancia_mm = obj.get("distancia_mm")
-        if distancia_mm is None:
-            return {"status": "ignored", "reason": "missing object.distancia_mm", "meter_id": meter_id, "version": VERSION}
-
-        battery_v = _safe_float(obj.get("bateria_V"))
-        temperature_c = _safe_float(obj.get("temperatura_C"))
-        tilt_deg = _safe_float(obj.get("inclinacio_deg"))
-
-        raw_value = float(distancia_mm)
-        raw_unit = "mm"
-        uplink_id = extract_uplink_id(body)
-
-        return ingest_core(
-            meter_id=meter_id,
-            raw_value=raw_value,
-            raw_unit=raw_unit,
-            location=None,
-            raw_payload_obj=body,
-            uplink_id=uplink_id,
-            battery_v=battery_v,
-            temperature_c=temperature_c,
-            tilt_deg=tilt_deg,
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Unhandled exception in /ingest_chs: %s", str(e))
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "Unhandled exception in /ingest_chs",
-                "message": str(e),
-                "trace": traceback.format_exc(),
-                "version": VERSION,
-            },
-        )
