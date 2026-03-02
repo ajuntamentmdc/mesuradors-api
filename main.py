@@ -12,13 +12,20 @@
 # ------------------------------------------------------------
 #  VERSION
 # ------------------------------------------------------------
-#  Version: 1.4.0
+#  Version: 1.5.0
 #  Date (UTC): 2026-03-02T00:00:00Z
 #
 # ------------------------------------------------------------
 #  CHANGELOG
 # ------------------------------------------------------------
-#  1.4.0 (2026-03-02)
+#  1.5.0 (2026-03-02)
+#   - FEATURE (METER META): Adds uplink frequency (minutes) to API outputs:
+#       - New column expected in BigQuery: mesuradors.meters.uplink_every_min (INT64)
+#       - /v1/locations/{loc}/estat and /v1/estat now include: uplink_every_min, uplink_label
+#   - UX SUPPORT: PWA can show 'UPLINK 5MIN / 1D' and later detect gaps/offline based on expected cadence.
+#   - No breaking changes: fields are additive.
+#
+#  1.5.0 (2026-03-02)
 #   - FEATURE (HISTORY API): Adds time-series endpoint for charts:
 #       GET /v1/meters/{meter_id}/series?window=6h|12h|24h|48h|7d|30d
 #     Returns bucketed points (latest reading per bucket) to keep payloads small.
@@ -86,7 +93,7 @@ CHS_DEVICE_MAP = {
     "nivell_gasoil_escola": "gasoil_escola",
 }
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 
 def table_id(name: str) -> str:
@@ -99,6 +106,25 @@ def view_id(name: str) -> str:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+
+def uplink_label_from_minutes(uplink_every_min: Optional[int]) -> Optional[str]:
+    if uplink_every_min is None:
+        return None
+    try:
+        m = int(uplink_every_min)
+    except Exception:
+        return None
+    if m <= 0:
+        return None
+    if m % (24 * 60) == 0:
+        d = m // (24 * 60)
+        return f"{d}D"
+    if m % 60 == 0:
+        h = m // 60
+        return f"{h}H"
+    return f"{m}MIN"
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -452,6 +478,13 @@ def bq_rows_to_dicts(rows) -> List[Dict[str, Any]]:
                 d["ultima_lectura"] = ts.isoformat()
             except Exception:
                 pass
+        # Derived label for UI (e.g. 5MIN, 1H, 1D)
+        try:
+            ulm = d.get("uplink_every_min")
+            d["uplink_label"] = uplink_label_from_minutes(ulm)
+        except Exception:
+            d["uplink_label"] = None
+
         out.append(d)
     return out
 
@@ -472,8 +505,11 @@ def list_locations():
 def estat_by_location(ubicacio: str):
     q = f"""
     SELECT
-      ubicacio, sensor, rang, v_act, unit, pct, estat, ultima_lectura
-    FROM `{view_id(VIEW_ESTAT_SCADA)}`
+      v.ubicacio, v.sensor, v.rang, v.v_act, v.unit, v.pct, v.estat, v.ultima_lectura,
+      m.uplink_every_min AS uplink_every_min
+    FROM `{view_id(VIEW_ESTAT_SCADA)}` v
+    LEFT JOIN `{table_id(TABLE_METERS)}` m
+      ON m.meter_id = v.sensor
     WHERE ubicacio = @ubicacio
     ORDER BY sensor
     """
@@ -491,8 +527,11 @@ def estat_by_location(ubicacio: str):
 def estat_all():
     q = f"""
     SELECT
-      ubicacio, sensor, rang, v_act, unit, pct, estat, ultima_lectura
-    FROM `{view_id(VIEW_ESTAT_SCADA)}`
+      v.ubicacio, v.sensor, v.rang, v.v_act, v.unit, v.pct, v.estat, v.ultima_lectura,
+      m.uplink_every_min AS uplink_every_min
+    FROM `{view_id(VIEW_ESTAT_SCADA)}` v
+    LEFT JOIN `{table_id(TABLE_METERS)}` m
+      ON m.meter_id = v.sensor
     ORDER BY ubicacio, sensor
     """
     rows = list(bq.query(q).result())
