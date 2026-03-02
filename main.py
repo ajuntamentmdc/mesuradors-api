@@ -2,21 +2,29 @@
 #  mesuradors-api — main.py
 # ============================================================
 #
-#  Project: mesuradors-mdc
-#  Dataset: mesuradors
+#  Project:  mesuradors-mdc
+#  Dataset:  mesuradors
+#  Service:  Cloud Run (FastAPI)
 #
 #  Pipeline:
-#    DF555 (LoRaWAN) → ChirpStack → HTTP Webhook → Cloud Run → BigQuery → PWA
+#    Sensor LoRaWAN → ChirpStack → HTTP Webhook → Cloud Run → BigQuery → API → PWA
 #
 # ------------------------------------------------------------
 #  VERSION
 # ------------------------------------------------------------
-#  Version: 1.3.1
-#  Date (UTC): 2026-02-28T00:00:00Z
+#  Version: 1.4.0
+#  Date (UTC): 2026-03-02T00:00:00Z
 #
 # ------------------------------------------------------------
 #  CHANGELOG
 # ------------------------------------------------------------
+#  1.4.0 (2026-03-02)
+#   - FEATURE (HISTORY API): Adds time-series endpoint for charts:
+#       GET /v1/meters/{meter_id}/series?window=6h|12h|24h|48h|7d|30d
+#     Returns bucketed points (latest reading per bucket) to keep payloads small.
+#   - UX SUPPORT: Keeps response schema stable and predictable for the PWA chart.
+#   - No breaking changes to ingestion or existing read-only endpoints.
+#
 #  1.3.1 (2026-02-28)
 #   - FIX (INGEST): Accepts DF555 decoded field names from ChirpStack `object`:
 #       - temperature_c: accepts `temperatura_C` OR `temperatura`
@@ -25,19 +33,15 @@
 #     This fixes NULL telemetry fields in BigQuery while keeping schema unchanged.
 #   - DIAG: Logs DF555 object keys when optional telemetry is missing.
 #
-#  1.3.0 (2026-02-22)
-#   - FEATURE (READ API): Adds read-only endpoints for PWA:
-#       GET /v1/locations
-#       GET /v1/locations/{ubicacio}/estat
-#       GET /v1/estat (optional: all)
-#     Data source: BigQuery view `mesuradors.v_estat_scada`
-#   - Keeps ingestion logic from 1.2.9 (gasoil_linear conversion; ignore join/status).
-#
 # ------------------------------------------------------------
 #  NOTES
 # ------------------------------------------------------------
-#  - v_estat_scada must exist in BigQuery (already created in this project).
-#  - CORS is open (*) for now; restrict later to https://mesuradors.massanet.cat
+#  - BigQuery objects expected:
+#      * Table:  {PROJECT_ID}.{DATASET_ID}.{TABLE_READINGS}
+#      * Table:  {PROJECT_ID}.{DATASET_ID}.{TABLE_METERS}
+#      * View:   {PROJECT_ID}.{DATASET_ID}.{VIEW_ESTAT_SCADA}
+#  - CORS is currently open (*) for simplicity; consider restricting later to:
+#      https://mesuradors.massanet.cat
 # ============================================================
 
 import os
@@ -45,9 +49,9 @@ import json
 import logging
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Literal
 
-from fastapi import FastAPI, Request, HTTPException, Body
+from fastapi import FastAPI, Request, HTTPException, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import bigquery
 
@@ -82,7 +86,7 @@ CHS_DEVICE_MAP = {
     "nivell_gasoil_escola": "gasoil_escola",
 }
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 
 def table_id(name: str) -> str:
@@ -209,13 +213,17 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def convert_value(raw_value: float, raw_unit: Optional[str], meter: Dict[str, Any]) -> Tuple[float, Optional[str]]:
+    """Convert incoming raw_value/raw_unit to the configured display unit/value.
+
+    Current supported scale_type:
+      - gasoil_linear: distance -> litres based on tank geometry parameters stored in mesuradors.meters
+    """
     scale_type = meter.get("scale_type")
     display_unit = meter.get("display_unit")
 
     if not scale_type:
         return float(raw_value), display_unit
 
-    # This is the configured scale_type in mesuradors.meters (e.g., gasoil_linear).
     if scale_type == "gasoil_linear":
         h = meter.get("h_sensor_cm")
         z = meter.get("zm_sensor_cm")
@@ -340,6 +348,12 @@ def health():
 
 @app.post("/ingest_chs/{secret}")
 async def ingest_chs(secret: str, request: Request, body: Dict[str, Any] = Body(...)):
+    """ChirpStack webhook ingestion.
+
+    Expected decoded payload for the DF555 level sensor:
+      body.object.distancia_mm (required)
+      body.object.bateria_V / temperatura_C / inclinacio_deg (optional)
+    """
     if secret != INGEST_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
@@ -358,12 +372,14 @@ async def ingest_chs(secret: str, request: Request, body: Dict[str, Any] = Body(
 
         distancia_mm = obj.get("distancia_mm")
         if distancia_mm is None:
-            return {"status": "ignored", "reason": "missing object.distancia_mm", "meter_id": meter_id, "version": VERSION}
+            return {
+                "status": "ignored",
+                "reason": "missing object.distancia_mm",
+                "meter_id": meter_id,
+                "version": VERSION,
+            }
 
         # Telemetry fields (optional). DF555 decoders/formatters vary by key name.
-        # We accept both naming conventions:
-        #   - bateria_V / temperatura_C / inclinacio_deg
-        #   - temperatura / inclinacio_graus (seen in current ChirpStack object)
         battery_v = _safe_float(
             obj.get("bateria_V")
             or obj.get("voltatge")
@@ -481,3 +497,121 @@ def estat_all():
     """
     rows = list(bq.query(q).result())
     return {"rows": bq_rows_to_dicts(rows), "version": VERSION}
+
+
+# -----------------------------
+# HISTORY API (CHARTS)
+# -----------------------------
+WindowKey = Literal["6h", "12h", "24h", "48h", "7d", "30d"]
+
+
+def _window_to_config(window: str) -> Tuple[int, int]:
+    """Return (lookback_seconds, bucket_seconds) for supported windows."""
+    w = (window or "").strip().lower()
+
+    mapping: Dict[str, Tuple[int, int]] = {
+        "6h": (6 * 3600, 5 * 60),                 # 5 min buckets
+        "12h": (12 * 3600, 10 * 60),              # 10 min buckets
+        "24h": (24 * 3600, 15 * 60),              # 15 min buckets
+        "48h": (48 * 3600, 30 * 60),              # 30 min buckets
+        "7d": (7 * 24 * 3600, 2 * 60 * 60),       # 2 h buckets
+        "30d": (30 * 24 * 3600, 6 * 60 * 60),     # 6 h buckets
+    }
+
+    if w not in mapping:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid window. Use one of: 6h, 12h, 24h, 48h, 7d, 30d",
+        )
+
+    return mapping[w]
+
+
+def _to_iso(ts: Any) -> str:
+    try:
+        return ts.isoformat()
+    except Exception:
+        return str(ts)
+
+
+@app.get("/v1/meters/{meter_id}/series")
+def meter_series(
+    meter_id: str,
+    window: WindowKey = Query("24h", description="6h|12h|24h|48h|7d|30d"),
+):
+    """Return bucketed time-series for a meter.
+
+    Response schema (stable):
+      {
+        "meter_id": "...",
+        "window": "24h",
+        "unit": "L",
+        "points": [{"t": "ISO8601", "v": 123.4}, ...],
+        "count": 123,
+        "bucket_seconds": 900,
+        "version": "1.4.0"
+      }
+    """
+    lookback_seconds, bucket_seconds = _window_to_config(window)
+
+    # Pick last reading per bucket to limit point count.
+    q = f"""
+    WITH base AS (
+      SELECT
+        event_time,
+        value,
+        unit,
+        TIMESTAMP_SECONDS(DIV(UNIX_SECONDS(event_time), @bucket_seconds) * @bucket_seconds) AS bucket_ts
+      FROM `{table_id(TABLE_READINGS)}`
+      WHERE meter_id = @meter_id
+        AND event_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @lookback_seconds SECOND)
+        AND value IS NOT NULL
+    ),
+    pick AS (
+      SELECT
+        bucket_ts,
+        event_time,
+        value,
+        unit,
+        ROW_NUMBER() OVER (PARTITION BY bucket_ts ORDER BY event_time DESC) AS rn
+      FROM base
+    )
+    SELECT bucket_ts, event_time, value, unit
+    FROM pick
+    WHERE rn = 1
+    ORDER BY bucket_ts ASC
+    """
+
+    job = bq.query(
+        q,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("meter_id", "STRING", meter_id),
+                bigquery.ScalarQueryParameter("bucket_seconds", "INT64", bucket_seconds),
+                bigquery.ScalarQueryParameter("lookback_seconds", "INT64", lookback_seconds),
+            ]
+        ),
+    )
+
+    rows = list(job.result())
+
+    points: List[Dict[str, Any]] = []
+    unit: Optional[str] = None
+
+    for r in rows:
+        d = dict(r)
+        unit = unit or d.get("unit")
+        points.append({
+            "t": d.get("event_time").isoformat() if d.get("event_time") else None,
+            "v": float(d.get("value")),
+        })
+
+    return {
+        "meter_id": meter_id,
+        "window": window,
+        "unit": unit,
+        "points": points,
+        "count": len(points),
+        "bucket_seconds": bucket_seconds,
+        "version": VERSION,
+    }
